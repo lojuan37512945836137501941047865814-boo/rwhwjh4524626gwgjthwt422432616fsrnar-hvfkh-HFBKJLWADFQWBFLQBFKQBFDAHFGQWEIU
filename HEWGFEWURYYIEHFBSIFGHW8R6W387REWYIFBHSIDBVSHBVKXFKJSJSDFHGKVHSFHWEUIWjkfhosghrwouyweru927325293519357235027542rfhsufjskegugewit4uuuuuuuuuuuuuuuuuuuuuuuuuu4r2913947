@@ -1,0 +1,226 @@
+local BuildLib = {}
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local virtualInput = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local guiservice = game:GetService("GuiService")
+local camera = workspace.CurrentCamera
+
+local buildButton = player.PlayerGui.BuildGUI2.Toolbar.BuildButton
+local target = player.PlayerGui.BuildGUI2.BuildMenu.Container.Container.BlockMenu.Blocks.Header.Container["1"]
+local buildMenu = player.PlayerGui.BuildGUI2.BuildMenu
+
+local BLOCK_SIZE = 2.5
+local BUILD_DELAY = 0.056
+local CLICK_DOWN = 0.0000001
+local MOVE_DELAY = 0.01
+local CAMERA_HEIGHT = 20
+local PLACE_TOLERANCE = 0.2
+
+local OFFSET_X_BLOCKS = -25
+local OFFSET_Y_BLOCKS = 0
+local OFFSET_Z_BLOCKS = 25
+
+local w = 51
+local h = 39
+
+BuildLib.isBuilding = false
+BuildLib.stopBuilding = false
+BuildLib.isClicking = false
+BuildLib.isTeleporting = false
+BuildLib.currentTargetCFrame = nil
+BuildLib.currentScreenPos = nil
+BuildLib.originalCameraType = nil
+BuildLib.originalCameraCFrame = nil
+BuildLib.buildObject = nil
+
+function BuildLib.activateGUI()
+    if not buildMenu.Visible then
+        local pos = buildButton.AbsolutePosition
+        local size = buildButton.AbsoluteSize
+        local inset = guiservice:GetGuiInset()
+        local x = pos.X + (size.X / 2)
+        local y = pos.Y + (size.Y / 2) + inset.Y
+        
+        virtualInput:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        virtualInput:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        task.wait(0.5)
+    end
+
+    if target then
+        local pos = target.AbsolutePosition
+        local size = target.AbsoluteSize
+        local inset = guiservice:GetGuiInset()
+        local x = pos.X + (size.X / 2)
+        local y = pos.Y + (size.Y / 2) + inset.Y
+        
+        virtualInput:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        virtualInput:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        
+        for _, connection in pairs(getconnections(target.MouseButton1Click)) do connection:Fire() end
+        for _, connection in pairs(getconnections(target.MouseButton1Down)) do connection:Fire() end
+        task.wait(0.3)
+    end
+end
+
+function BuildLib.cleanup()
+    if not BuildLib.isBuilding and not BuildLib.isClicking and not BuildLib.isTeleporting and not BuildLib.currentTargetCFrame then return end
+    
+    BuildLib.isBuilding = false
+    BuildLib.isClicking = false
+    BuildLib.isTeleporting = false
+    BuildLib.currentTargetCFrame = nil
+    BuildLib.currentScreenPos = nil
+    
+    if BuildLib.originalCameraType then
+        camera.CameraType = BuildLib.originalCameraType
+        BuildLib.originalCameraType = nil
+    end
+    if BuildLib.originalCameraCFrame then
+        camera.CFrame = BuildLib.originalCameraCFrame
+        BuildLib.originalCameraCFrame = nil
+    end
+    
+    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+    pcall(function() RunService:UnbindFromRenderStep("LockBlock_Pre") end)
+    pcall(function() RunService:UnbindFromRenderStep("LockBlock_Post") end)
+end
+
+function BuildLib.teleBuildTarget(cf)
+    if BuildLib.stopBuilding then return end
+    BuildLib.isTeleporting = true
+    pcall(function()
+        if BuildLib.buildObject:IsA("Model") then
+            BuildLib.buildObject:PivotTo(cf)
+        elseif BuildLib.buildObject:IsA("BasePart") then
+            BuildLib.buildObject.CFrame = cf
+        end
+    end)
+    BuildLib.isTeleporting = false
+end
+
+function BuildLib.isBlockAtTarget(cf)
+    local cur = BuildLib.buildObject:IsA("Model") and BuildLib.buildObject:GetPivot() or BuildLib.buildObject.CFrame
+    return (cur.Position - cf.Position).Magnitude < PLACE_TOLERANCE
+end
+
+function BuildLib.getPlotOrigin()
+    local buildingZones = workspace:WaitForChild("BuildingZones")
+    for i = 1, 12 do
+        local zone = buildingZones:FindFirstChild("Zone" .. i)
+        if zone and zone:FindFirstChild("Owner") then
+            local ov = zone.Owner.Value
+            if ov == player or ov == player.Name or ov == player.UserId then
+                local blPart = zone:FindFirstChild("BlackListPart")
+                    and zone.BlackListPart:FindFirstChild("BlackListPart")
+                if blPart then
+                    return blPart.CFrame * CFrame.new(0, -blPart.Size.Y / 2, 0)
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function BuildLib.lockCameraToTarget(targetPos)
+    if BuildLib.stopBuilding then return end
+    camera.CameraType = Enum.CameraType.Scriptable
+    local camPos = targetPos + Vector3.new(0, CAMERA_HEIGHT, 0)
+    camera.CFrame = CFrame.new(camPos, targetPos)
+end
+
+function BuildLib.worldToScreen(worldPos)
+    local screenVec, onScreen = camera:WorldToViewportPoint(worldPos)
+    if not onScreen or screenVec.Z <= 0 then
+        local vp = camera.ViewportSize
+        return Vector2.new(vp.X / 2, vp.Y / 2), false
+    end
+    return Vector2.new(math.round(screenVec.X), math.round(screenVec.Y)), true
+end
+
+function BuildLib.autoBuildWall()
+    if BuildLib.isBuilding then return end
+    BuildLib.isBuilding = true
+    BuildLib.stopBuilding = false
+    BuildLib.isClicking = false
+
+    BuildLib.originalCameraType = camera.CameraType
+    BuildLib.originalCameraCFrame = camera.CFrame
+
+    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+
+    local baseCFrame = BuildLib.getPlotOrigin()
+    if not baseCFrame then BuildLib.cleanup() return end
+
+    local basePos = baseCFrame.Position
+    local _, baseY, _ = baseCFrame:ToEulerAnglesYXZ()
+    local baseRotation = CFrame.Angles(0, baseY, 0)
+
+    for y = 0, h - 1 do
+        if BuildLib.stopBuilding then break end
+        for x = 0, w - 1 do
+            if BuildLib.stopBuilding then break end
+
+            pcall(function()
+                if BuildLib.stopBuilding then return end
+                
+                local targetCFrame = CFrame.new(basePos) * baseRotation * CFrame.new(
+                    (x + OFFSET_X_BLOCKS) * BLOCK_SIZE, 
+                    (y + OFFSET_Y_BLOCKS) * BLOCK_SIZE, 
+                    OFFSET_Z_BLOCKS * BLOCK_SIZE
+                )
+                local targetPos = targetCFrame.Position
+
+                BuildLib.currentTargetCFrame = targetCFrame
+                BuildLib.currentScreenPos = BuildLib.worldToScreen(targetPos)
+
+                if BuildLib.stopBuilding then return end
+                BuildLib.lockCameraToTarget(targetPos)
+                if BuildLib.stopBuilding then return end
+                RunService.RenderStepped:Wait()
+
+                if BuildLib.stopBuilding then return end
+                BuildLib.teleBuildTarget(targetCFrame)
+                if BuildLib.stopBuilding then return end
+                RunService.RenderStepped:Wait()
+                if BuildLib.stopBuilding then return end
+                BuildLib.teleBuildTarget(targetCFrame)
+
+                local sx = BuildLib.currentScreenPos.X
+                local sy = BuildLib.currentScreenPos.Y
+
+                BuildLib.isClicking = true
+
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                virtualInput:SendMouseMoveEvent(sx, sy, game)
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                task.wait(MOVE_DELAY)
+
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                BuildLib.teleBuildTarget(targetCFrame)
+
+                if not BuildLib.isBlockAtTarget(targetCFrame) then
+                    BuildLib.isClicking = false
+                    return
+                end
+
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                virtualInput:SendMouseButtonEvent(sx, sy, 0, true, game, 1)
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                task.wait(CLICK_DOWN)
+                if BuildLib.stopBuilding then BuildLib.isClicking = false return end
+                virtualInput:SendMouseButtonEvent(sx, sy, 0, false, game, 1)
+
+                BuildLib.isClicking = false
+            end)
+
+            task.wait(BUILD_DELAY)
+        end
+    end
+
+    BuildLib.cleanup()
+end
+
+return BuildLib
